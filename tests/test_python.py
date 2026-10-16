@@ -40,3 +40,21 @@ def test_alternate_wire_magic():
     output = np.empty_like(source)
     decompress_into_with_magic(alternate, output.view(np.uint8), b"ALT1")
     np.testing.assert_array_equal(output, source)
+
+
+def test_concurrent_roundtrip():
+    from concurrent.futures import ThreadPoolExecutor
+
+    rng = np.random.default_rng(0)
+    chunks = [
+        rng.integers(0, 4096, size=(16, 32, 32), dtype=np.uint16)
+        for _ in range(32)
+    ]
+    codec = Delta3D()
+
+    def roundtrip(chunk):
+        decoded = np.frombuffer(codec.decode(codec.encode(chunk)), np.uint16)
+        return np.array_equal(decoded.reshape(chunk.shape), chunk)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        assert all(pool.map(roundtrip, chunks))

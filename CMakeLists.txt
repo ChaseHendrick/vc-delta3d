@@ -35,7 +35,7 @@ if(VC_DELTA3D_BUILD_PYTHON)
     endif()
     find_package(nanobind CONFIG REQUIRED)
 
-    nanobind_add_module(vc_delta3d_python NOMINSIZE python/bindings.cpp)
+    nanobind_add_module(vc_delta3d_python NOMINSIZE FREE_THREADED python/bindings.cpp)
     set_target_properties(vc_delta3d_python PROPERTIES OUTPUT_NAME _codec)
     target_link_libraries(vc_delta3d_python PRIVATE vc_delta3d::vc_delta3d)
     target_compile_features(vc_delta3d_python PRIVATE cxx_std_20)
