@@ -1,5 +1,6 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
+#include <nanobind/stl/optional.h>
 
 #include <vc_delta3d/codec.hpp>
 
@@ -123,6 +124,28 @@ NB_MODULE(_codec, m)
         },
         "raw"_a, "z"_a, "y"_a, "x"_a, "elem_size"_a, "quant"_a = 1);
 
+    m.def(
+        "compress_channels",
+        [](nb::bytes raw, int z, int y, int x, int channels, bool channels_last,
+           int elem_size, int quant) {
+            const auto input = bytesSpan(raw);
+            std::vector<std::byte> out;
+            {
+                nb::gil_scoped_release release;
+                out = vc_delta3d::compressChannels(
+                    input, {z, y, x}, channels,
+                    channels_last ? vc_delta3d::ChannelLayout::Last
+                                  : vc_delta3d::ChannelLayout::First,
+                    static_cast<std::size_t>(elem_size), quant);
+            }
+            return toBytes(out);
+        },
+        "raw"_a, "z"_a, "y"_a, "x"_a, "channels"_a, "channels_last"_a,
+        "elem_size"_a, "quant"_a = 1);
+    m.def(
+        "channel_count",
+        [](nb::bytes payload) { return vc_delta3d::channelCount(bytesSpan(payload)); },
+        "payload"_a);
     m.def("compress_array", &compressArray<std::uint8_t>,
           "array"_a, "quant"_a = 1);
     m.def("compress_array", &compressArray<std::uint16_t>,
