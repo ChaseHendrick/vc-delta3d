@@ -17,10 +17,11 @@ set_target_properties(vc_delta3d PROPERTIES
 )
 target_compile_features(vc_delta3d PUBLIC cxx_std_20)
 # The context-model coder (Predictor::Ctx) is C11, vendored in src/volcodec/.
-set_source_files_properties(src/volcodec/llctx.c PROPERTIES
+# C_STANDARD is a target property (CMake ignores it on a source file) and
+# applies only to the target's C source; MSVC needs it for /std:c11.
+set_target_properties(vc_delta3d PROPERTIES
     C_STANDARD 11
     C_STANDARD_REQUIRED ON
-    C_EXTENSIONS OFF
 )
 if(NOT MSVC)
     target_link_libraries(vc_delta3d PRIVATE m)
@@ -84,6 +85,7 @@ if(VC_DELTA3D_BUILD_TESTS)
     target_include_directories(vc_delta3d_lpc_tests PRIVATE include)
     target_link_libraries(vc_delta3d_lpc_tests PRIVATE vc_delta3d_doctest)
     target_compile_features(vc_delta3d_lpc_tests PRIVATE cxx_std_20)
+    set_target_properties(vc_delta3d_lpc_tests PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(vc_delta3d_lpc_tests PRIVATE -ffp-contract=off)
     endif()
