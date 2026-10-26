@@ -1222,6 +1222,26 @@ static void vcn_lc_cls_neon(const uint8_t *e, size_t ri, const vcn_lc_par *p, ui
   uint8x16_t t8[VCN_LC_MAXK];
   uint16x8_t t16[VCN_LC_MAXK];
   for (int k = 0; k < nk; k++) t8[k] = vdupq_n_u8((uint8_t)(p->thr[k] < 255 ? p->thr[k] : 255)), t16[k] = vdupq_n_u16(p->thr[k]);
+  if (tmax < 255) { /* the class of min(activity, 255) by a 256-entry table, the activity by saturating byte adds */
+    const uint8x16x4_t l0 = vld1q_u8_x4(p->lut), l1 = vld1q_u8_x4(p->lut + 64), l2 = vld1q_u8_x4(p->lut + 128),
+                       l3 = vld1q_u8_x4(p->lut + 192);
+    const uint8x16_t k64 = vdupq_n_u8(64), k128 = vdupq_n_u8(128), k192 = vdupq_n_u8(192);
+    for (int x = 0; x < VCN_LC_D; x += 16) {
+      const uint8x16_t N = vld1q_u8(n + x), U = vld1q_u8(u + x);
+      uint8x16_t t = vqaddq_u8(N, U);
+      t = vqaddq_u8(t, t);
+      const uint8x16_t t2 = vqaddq_u8(vld1q_u8(n + x - 1), vld1q_u8(n + x + 1)), t3 = vqaddq_u8(vld1q_u8(u + x - 1), vld1q_u8(u + x + 1)),
+                       t4 = vqaddq_u8(vld1q_u8(u + x - VCN_LC_RP), vld1q_u8(u + x + VCN_LC_RP)), t5 = vqaddq_u8(vld1q_u8(nn + x), vld1q_u8(uu + x));
+      const uint8x16_t a8 = vqaddq_u8(vqaddq_u8(t, t2), vqaddq_u8(t3, vqaddq_u8(t4, t5)));
+      uint8x16_t c = vqtbl4q_u8(l0, a8);
+      c = vqtbx4q_u8(c, l1, vsubq_u8(a8, k64)), c = vqtbx4q_u8(c, l2, vsubq_u8(a8, k128)), c = vqtbx4q_u8(c, l3, vsubq_u8(a8, k192));
+      const uint8x16_t bl = vqtbl1q_u8(tlo, c), bh = vqtbl1q_u8(thi, c);
+      vst1q_u16(A + x, vaddq_u16(vld1q_u16(A + x), vreinterpretq_u16_u8(vzip1q_u8(bl, bh))));
+      vst1q_u16(A + x + 8, vaddq_u16(vld1q_u16(A + x + 8), vreinterpretq_u16_u8(vzip2q_u8(bl, bh))));
+      vst1q_u8(kc + x, c);
+    }
+    return;
+  }
   for (int x = 0; x < VCN_LC_D; x += 16) {
     const uint8x16_t N = vld1q_u8(n + x), U = vld1q_u8(u + x), Nw = vld1q_u8(n + x - 1), Ne = vld1q_u8(n + x + 1),
                      Uw = vld1q_u8(u + x - 1), Ue = vld1q_u8(u + x + 1), Un = vld1q_u8(u + x - VCN_LC_RP),
@@ -1337,36 +1357,43 @@ __attribute__((target("avx2"))) static void vcn_lc_pre_avx2(const uint8_t *row, 
 }
 #define VCN_LC_PRE(r, pl, b, o) (vcn_use_avx2() ? vcn_lc_pre_avx2(r, pl, b, o) : vcn_lc_pre_c(r, pl, b, o))
 #elif VCN_HAVE_NEON
-/* the same modulo 2^16, the whole row (16 accumulators) per tap: a weight below 256 in size is one widening
-   multiply-add (or -subtract) of the bytes; a larger one multiplies the widened bytes */
+/* the same modulo 2^16, the whole row per tap in 16 accumulators: a weight below 256 in size is one widening
+   multiply-add (or -subtract) of the bytes, a larger one multiplies the widened bytes */
+#define VCN_LC_X8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
 static void vcn_lc_pre_neon(const uint8_t *row, const vcn_lc_plist *pl, uint16_t bias, uint16_t *restrict pre) {
-  uint16x8_t a[16];
-  for (int i = 0; i < 16; i++) a[i] = vdupq_n_u16(bias);
+#define VCN_LC_A(i) uint16x8_t a##i##l = vdupq_n_u16(bias), a##i##h = a##i##l;
+  VCN_LC_X8(VCN_LC_A)
+#undef VCN_LC_A
   for (int k = 0; k < pl->np; k++) {
     const uint8_t *s = row + pl->o[k];
     const int w = (int16_t)pl->w[k];
+#define VCN_LC_V(i) const uint8x16_t v##i = vld1q_u8(s + 16 * i);
+    VCN_LC_X8(VCN_LC_V)
+#undef VCN_LC_V
     if (w >= 0 && w < 256) {
       const uint8x16_t d = vdupq_n_u8((uint8_t)w);
-      for (int i = 0; i < 8; i++) {
-        const uint8x16_t v = vld1q_u8(s + 16 * i);
-        a[2 * i] = vmlal_u8(a[2 * i], vget_low_u8(v), vget_low_u8(d)), a[2 * i + 1] = vmlal_high_u8(a[2 * i + 1], v, d);
-      }
+      const uint8x8_t dl = vget_low_u8(d);
+#define VCN_LC_M(i) a##i##l = vmlal_u8(a##i##l, vget_low_u8(v##i), dl), a##i##h = vmlal_high_u8(a##i##h, v##i, d);
+      VCN_LC_X8(VCN_LC_M)
+#undef VCN_LC_M
     } else if (w < 0 && w > -256) {
       const uint8x16_t d = vdupq_n_u8((uint8_t)-w);
-      for (int i = 0; i < 8; i++) {
-        const uint8x16_t v = vld1q_u8(s + 16 * i);
-        a[2 * i] = vmlsl_u8(a[2 * i], vget_low_u8(v), vget_low_u8(d)), a[2 * i + 1] = vmlsl_high_u8(a[2 * i + 1], v, d);
-      }
+      const uint8x8_t dl = vget_low_u8(d);
+#define VCN_LC_M(i) a##i##l = vmlsl_u8(a##i##l, vget_low_u8(v##i), dl), a##i##h = vmlsl_high_u8(a##i##h, v##i, d);
+      VCN_LC_X8(VCN_LC_M)
+#undef VCN_LC_M
     } else {
       const uint16_t wu = pl->w[k];
-      for (int i = 0; i < 8; i++) {
-        const uint8x16_t v = vld1q_u8(s + 16 * i);
-        a[2 * i] = vmlaq_n_u16(a[2 * i], vmovl_u8(vget_low_u8(v)), wu), a[2 * i + 1] = vmlaq_n_u16(a[2 * i + 1], vmovl_high_u8(v), wu);
-      }
+#define VCN_LC_M(i) a##i##l = vmlaq_n_u16(a##i##l, vmovl_u8(vget_low_u8(v##i)), wu), a##i##h = vmlaq_n_u16(a##i##h, vmovl_high_u8(v##i), wu);
+      VCN_LC_X8(VCN_LC_M)
+#undef VCN_LC_M
     }
   }
-  for (int i = 0; i < 16; i++) vst1q_u16(pre + 8 * i, a[i]);
+#define VCN_LC_S(i) vst1q_u16(pre + 16 * i, a##i##l), vst1q_u16(pre + 16 * i + 8, a##i##h);
+  VCN_LC_X8(VCN_LC_S)
+#undef VCN_LC_S
 }
+#undef VCN_LC_X8
 #define VCN_LC_PRE(r, pl, b, o) vcn_lc_pre_neon(r, pl, b, o)
 #else
 #define VCN_LC_PRE(r, pl, b, o) vcn_lc_pre_c(r, pl, b, o)
@@ -1926,59 +1953,26 @@ static const uint8_t vcn_lc_perm4[16][16] = {
     {0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7},   {0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
     {0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}};
 static void vcn_lc_syms_neon(int n, const uint8_t *restrict cl, vcn_lc_dec *D, uint8_t *restrict sym) {
+  /* scalar and branch-free while 64 bytes of words remain: a state takes the next word when it fell below
+     the bound */
   const int tb = D->tb;
-  const int32x4_t ptb = vdupq_n_s32(tb), ntb = vdupq_n_s32(-tb);
-  const uint32x4_t kM = vdupq_n_u32((1u << tb) - 1u), kF = vdupq_n_u32(0xFFF), k1 = vdupq_n_u32(1), kL = vdupq_n_u32(VCN_LC_RL);
-  static const uint32_t kb[4] = {1, 2, 4, 8};
-  const uint32x4_t kbit = vld1q_u32(kb);
-  uint32x4_t S[8];
-  for (int h = 0; h < 8; h++) S[h] = vld1q_u32(D->S + 4 * h);
+  const uint32_t mask = (1u << tb) - 1u;
   const uint32_t *T = D->T;
   const uint8_t *p = D->p, *end = D->end;
-  size_t over = D->over;
-  for (int i = 0; i < n; i += 32) {
-    const uint8x16_t ca = vld1q_u8(cl + i), cb = vld1q_u8(cl + i + 16);
-    const uint16x8_t cw[4] = {vmovl_u8(vget_low_u8(ca)), vmovl_high_u8(ca), vmovl_u8(vget_low_u8(cb)), vmovl_high_u8(cb)};
-    uint16x4_t y[8];
-    uint32x4_t s2[8], m[8];
-    unsigned bits[8], cnt[8];
-    /* the 32 states' steps first: none needs a word, so the eight groups run side by side */
-    for (int h = 0; h < 8; h++) {
-      const uint32x4_t cv = (h & 1) ? vmovl_high_u16(cw[h >> 1]) : vmovl_u16(vget_low_u16(cw[h >> 1]));
-      const uint32x4_t ix = vaddq_u32(vshlq_u32(cv, ptb), vandq_u32(S[h], kM));
-      uint32x4_t en = vdupq_n_u32(0);
-      en = vld1q_lane_u32(T + vgetq_lane_u32(ix, 0), en, 0);
-      en = vld1q_lane_u32(T + vgetq_lane_u32(ix, 1), en, 1);
-      en = vld1q_lane_u32(T + vgetq_lane_u32(ix, 2), en, 2);
-      en = vld1q_lane_u32(T + vgetq_lane_u32(ix, 3), en, 3);
-      s2[h] = vmlaq_u32(vshrq_n_u32(en, 20), vaddq_u32(vandq_u32(vshrq_n_u32(en, 8), kF), k1), vshlq_u32(S[h], ntb));
-      m[h] = vcltq_u32(s2[h], kL);
-      bits[h] = vaddvq_u32(vandq_u32(m[h], kbit)), cnt[h] = vaddvq_u32(vshrq_n_u32(m[h], 31));
-      y[h] = vmovn_u32(en);
+  int i = 0;
+  for (; i < n && end - p >= 64; i += 32)
+    for (int k = 0; k < VCN_LC_NS; k++) {
+      uint32_t S = D->S[k];
+      const uint32_t en = T[((uint32_t)cl[i + k] << tb) + (S & mask)];
+      S = (((en >> 8) & 0xFFFu) + 1u) * (S >> tb) + (en >> 20);
+      const uint32_t need = S < VCN_LC_RL, w = vcn_rd16(p);
+      S = (S << (16 * need)) | (w & (0u - need));
+      p += 2 * need;
+      D->S[k] = S;
+      sym[i + k] = (uint8_t)en;
     }
-    /* then the words, in state order: group h starts after the words of groups 0..h-1 */
-    if (end - p >= 64) {
-      for (int h = 0; h < 8; h++) {
-        const uint32x4_t w = vmovl_u16(vreinterpret_u16_u8(vld1_u8(p)));
-        const uint32x4_t wv = vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(w), vld1q_u8(vcn_lc_perm4[bits[h]])));
-        S[h] = vbslq_u32(m[h], vorrq_u32(vshlq_n_u32(s2[h], 16), wv), s2[h]);
-        p += 2 * cnt[h];
-      }
-    } else
-      for (int h = 0; h < 8; h++) {
-        uint32_t sv[4];
-        vst1q_u32(sv, s2[h]);
-        for (int k = 0; k < 4; k++)
-          if (bits[h] >> k & 1u) {
-            if (end - p >= 2) sv[k] = (sv[k] << 16) | vcn_rd16(p), p += 2;
-            else sv[k] <<= 16, over++;
-          }
-        S[h] = vld1q_u32(sv);
-      }
-    for (int q = 0; q < 4; q++) vst1_u8(sym + i + 8 * q, vmovn_u16(vcombine_u16(y[2 * q], y[2 * q + 1])));
-  }
-  for (int h = 0; h < 8; h++) vst1q_u32(D->S + 4 * h, S[h]);
-  D->p = p, D->over = over;
+  D->p = p;
+  if (i < n) vcn_lc_syms_c(n - i, cl + i, D, sym + i);
 }
 /* rebuild, 8 lanes per vector: NH vectors (2 when the group has at most 16 rows, else 4) */
 #define VCN_LC_REC_NEON(NH)                                                                                                   \
@@ -1989,19 +1983,20 @@ static void vcn_lc_syms_neon(int n, const uint8_t *restrict cl, vcn_lc_dec *D, u
       W0[h] = vld1q_u16(L->W[0] + 8 * h), W1[h] = vld1q_u16(L->W[1] + 8 * h), W2[h] = vld1q_u16(L->W[2] + 8 * h);              \
     for (int x = 0; x < VCN_LC_D; x++)                                                                                         \
       for (int h = 0; h < NH; h++) {                                                                                           \
-        const uint16x8_t P = vmlaq_u16(vmlaq_u16(vmlaq_u16(vld1q_u16(A[x] + 8 * h), W0[h], w0[h]), W1[h], w1[h]), W2[h], w2[h]); \
+        /* the newest value last, so the chain from one x to the next is one multiply-add */                               \
+        const uint16x8_t P = vmlaq_u16(vmlaq_u16(vmlaq_u16(vld1q_u16(A[x] + 8 * h), W2[h], w2[h]), W1[h], w1[h]), W0[h], w0[h]); \
         const uint16x8_t sy = vmovl_u8(vld1_u8(SY[x] + 8 * h));                                                                \
-        const int16x8_t es =                                                                                                   \
-            veorq_s16(vreinterpretq_s16_u16(vshrq_n_u16(sy, 1)), vnegq_s16(vreinterpretq_s16_u16(vandq_u16(sy, k1))));        \
-        const int16x8_t fm = vshrq_n_s16(vreinterpretq_s16_u16(vshlq_n_u16(P, 8)), 15);                                      \
-        const uint16x8_t vv = vandq_u16(                                                                                       \
-            vaddq_u16(vshrq_n_u16(vaddq_u16(P, k128), 8), vreinterpretq_u16_s16(vsubq_s16(veorq_s16(es, fm), fm))), kB);       \
+        const uint16x8_t es = veorq_u16(vshrq_n_u16(sy, 1), vnegq_u16_(vandq_u16(sy, k1)));                                   \
+        const uint16x8_t fm = vtstq_u16(P, k128);                     /* the prediction was rounded up */                    \
+        const uint16x8_t r = vbslq_u16(fm, vsubq_u16(vdupq_n_u16(0), es), es);                                                \
+        const uint16x8_t vv = vandq_u16(vsraq_n_u16(r, vaddq_u16(P, k128), 8), kB);                                            \
         W2[h] = W1[h], W1[h] = W0[h], W0[h] = vv;                                                                              \
         vst1_u8(V[x] + 8 * h, vmovn_u16(vv));                                                                                  \
       }                                                                                                                        \
     for (int h = 0; h < NH; h++)                                                                                               \
       vst1q_u16(L->W[0] + 8 * h, W0[h]), vst1q_u16(L->W[1] + 8 * h, W1[h]), vst1q_u16(L->W[2] + 8 * h, W2[h]);                 \
   } while (0)
+static inline uint16x8_t vnegq_u16_(uint16x8_t v) { return vsubq_u16(vdupq_n_u16(0), v); }
 static void vcn_lc_rec_neon(int nl, const uint16_t (*restrict A)[VCN_LC_NL], const uint8_t (*restrict SY)[VCN_LC_NL], vcn_lc_lanes *L,
                             uint8_t (*restrict V)[VCN_LC_NL]) {
   const uint16x8_t k128 = vdupq_n_u16(128), k1 = vdupq_n_u16(1), kB = vdupq_n_u16(255);
