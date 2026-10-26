@@ -22,7 +22,7 @@
  * predictor, which mode 5 shares. Comments in the mode 6 section that mention vcn_opts refer to the
  * full codec's options; here the encoder always writes mode 6.
  *
- * Generated from Chase Hendrick's volcodec_ng.h (sha256 13cb5d96c550ddf6...a8e0d25c) by lossless_header.py in
+ * Generated from Chase Hendrick's volcodec_ng.h (sha256 de285ee22ebc5730...987ebcc4) by lossless_header.py in
  * the codec source; the function bodies are verbatim copies.
  *
  * MIT License, Copyright (c) 2026 Chase Hendrick (see LICENSE next to this file). */
@@ -991,7 +991,10 @@ static void vcn_lc_gram_neon(const int16_t *F, int ncp, int64_t *G) {
 #endif
 /* least squares over the candidate taps (or those of slice 0), greedy selection of nsel, weights rounded
    to 1/256 with their sum kept; returns 1 on success, else the W predictor */
-static int vcn_lc_fit(const uint8_t *b, const vcn_lc_taps *t, int zlo, int zhi, int stride, int slice_only, int nsel, int32_t *wq, int32_t *bias) {
+/* ridge (mode 7 only; 0 for mode 6, where adding it changes nothing): added to the diagonal of the taps' covariance,
+   the variance of the noise the decoder's taps carry */
+static int vcn_lc_fit_r(const uint8_t *b, const vcn_lc_taps *t, int zlo, int zhi, int stride, int slice_only, int nsel, double ridge,
+                        int32_t *wq, int32_t *bias) {
   int id[VCN_LC_MAXT], nt = 0;
   for (int k = 0; k < t->nt; k++)
     if (!slice_only || t->dz[k] == 0) id[nt++] = k;
@@ -1046,7 +1049,7 @@ static int vcn_lc_fit(const uint8_t *b, const vcn_lc_taps *t, int zlo, int zhi, 
       }
       tr += C[a * nt + a];
     }
-    for (int a = 0; a < nt; a++) C[a * nt + a] += 1e-6 * tr / nt + 1e-9;
+    for (int a = 0; a < nt; a++) C[a * nt + a] += 1e-6 * tr / nt + 1e-9 + ridge;
     if (nsel > 0 && nsel < nt) { /* greedy forward selection by partial covariances (Schur complements) */
       double *R = (double *)malloc(sizeof(double) * nt * nt), rb[VCN_LC_MAXT];
       memcpy(R, C, sizeof(double) * nt * nt), memcpy(rb, cb, sizeof(double) * nt);
@@ -1117,6 +1120,9 @@ static int vcn_lc_fit(const uint8_t *b, const vcn_lc_taps *t, int zlo, int zhi, 
   if (!ok) wq[0] = 256; /* W */
   free(A), free(bv);
   return ok;
+}
+static int vcn_lc_fit(const uint8_t *b, const vcn_lc_taps *t, int zlo, int zhi, int stride, int slice_only, int nsel, int32_t *wq, int32_t *bias) {
+  return vcn_lc_fit_r(b, t, zlo, zhi, stride, slice_only, nsel, 0.0, wq, bias);
 }
 #define VCN_LC_AMAX 2560 /* activity < 14 * 129 */
 typedef struct {
@@ -1222,6 +1228,26 @@ static void vcn_lc_cls_neon(const uint8_t *e, size_t ri, const vcn_lc_par *p, ui
   uint8x16_t t8[VCN_LC_MAXK];
   uint16x8_t t16[VCN_LC_MAXK];
   for (int k = 0; k < nk; k++) t8[k] = vdupq_n_u8((uint8_t)(p->thr[k] < 255 ? p->thr[k] : 255)), t16[k] = vdupq_n_u16(p->thr[k]);
+  if (tmax < 255) { /* the class of min(activity, 255) by a 256-entry table, the activity by saturating byte adds */
+    const uint8x16x4_t l0 = vld1q_u8_x4(p->lut), l1 = vld1q_u8_x4(p->lut + 64), l2 = vld1q_u8_x4(p->lut + 128),
+                       l3 = vld1q_u8_x4(p->lut + 192);
+    const uint8x16_t k64 = vdupq_n_u8(64), k128 = vdupq_n_u8(128), k192 = vdupq_n_u8(192);
+    for (int x = 0; x < VCN_LC_D; x += 16) {
+      const uint8x16_t N = vld1q_u8(n + x), U = vld1q_u8(u + x);
+      uint8x16_t t = vqaddq_u8(N, U);
+      t = vqaddq_u8(t, t);
+      const uint8x16_t t2 = vqaddq_u8(vld1q_u8(n + x - 1), vld1q_u8(n + x + 1)), t3 = vqaddq_u8(vld1q_u8(u + x - 1), vld1q_u8(u + x + 1)),
+                       t4 = vqaddq_u8(vld1q_u8(u + x - VCN_LC_RP), vld1q_u8(u + x + VCN_LC_RP)), t5 = vqaddq_u8(vld1q_u8(nn + x), vld1q_u8(uu + x));
+      const uint8x16_t a8 = vqaddq_u8(vqaddq_u8(t, t2), vqaddq_u8(t3, vqaddq_u8(t4, t5)));
+      uint8x16_t c = vqtbl4q_u8(l0, a8);
+      c = vqtbx4q_u8(c, l1, vsubq_u8(a8, k64)), c = vqtbx4q_u8(c, l2, vsubq_u8(a8, k128)), c = vqtbx4q_u8(c, l3, vsubq_u8(a8, k192));
+      const uint8x16_t bl = vqtbl1q_u8(tlo, c), bh = vqtbl1q_u8(thi, c);
+      vst1q_u16(A + x, vaddq_u16(vld1q_u16(A + x), vreinterpretq_u16_u8(vzip1q_u8(bl, bh))));
+      vst1q_u16(A + x + 8, vaddq_u16(vld1q_u16(A + x + 8), vreinterpretq_u16_u8(vzip2q_u8(bl, bh))));
+      vst1q_u8(kc + x, c);
+    }
+    return;
+  }
   for (int x = 0; x < VCN_LC_D; x += 16) {
     const uint8x16_t N = vld1q_u8(n + x), U = vld1q_u8(u + x), Nw = vld1q_u8(n + x - 1), Ne = vld1q_u8(n + x + 1),
                      Uw = vld1q_u8(u + x - 1), Ue = vld1q_u8(u + x + 1), Un = vld1q_u8(u + x - VCN_LC_RP),
@@ -1337,20 +1363,43 @@ __attribute__((target("avx2"))) static void vcn_lc_pre_avx2(const uint8_t *row, 
 }
 #define VCN_LC_PRE(r, pl, b, o) (vcn_use_avx2() ? vcn_lc_pre_avx2(r, pl, b, o) : vcn_lc_pre_c(r, pl, b, o))
 #elif VCN_HAVE_NEON
-/* the same with 16-bit multiply-adds by the whole weight (modulo 2^16, as the C form), 32 voxels per step */
+/* the same modulo 2^16, the whole row per tap in 16 accumulators: a weight below 256 in size is one widening
+   multiply-add (or -subtract) of the bytes, a larger one multiplies the widened bytes */
+#define VCN_LC_X8(F) F(0) F(1) F(2) F(3) F(4) F(5) F(6) F(7)
 static void vcn_lc_pre_neon(const uint8_t *row, const vcn_lc_plist *pl, uint16_t bias, uint16_t *restrict pre) {
-  for (int x = 0; x < VCN_LC_D; x += 32) {
-    uint16x8_t a0 = vdupq_n_u16(bias), a1 = a0, a2 = a0, a3 = a0;
-    for (int k = 0; k < pl->np; k++) {
-      const uint8_t *s = row + pl->o[k] + x;
-      const uint8x16_t v0 = vld1q_u8(s), v1 = vld1q_u8(s + 16);
-      const uint16_t w = pl->w[k];
-      a0 = vmlaq_n_u16(a0, vmovl_u8(vget_low_u8(v0)), w), a1 = vmlaq_n_u16(a1, vmovl_high_u8(v0), w);
-      a2 = vmlaq_n_u16(a2, vmovl_u8(vget_low_u8(v1)), w), a3 = vmlaq_n_u16(a3, vmovl_high_u8(v1), w);
+#define VCN_LC_A(i) uint16x8_t a##i##l = vdupq_n_u16(bias), a##i##h = a##i##l;
+  VCN_LC_X8(VCN_LC_A)
+#undef VCN_LC_A
+  for (int k = 0; k < pl->np; k++) {
+    const uint8_t *s = row + pl->o[k];
+    const int w = (int16_t)pl->w[k];
+#define VCN_LC_V(i) const uint8x16_t v##i = vld1q_u8(s + 16 * i);
+    VCN_LC_X8(VCN_LC_V)
+#undef VCN_LC_V
+    if (w >= 0 && w < 256) {
+      const uint8x16_t d = vdupq_n_u8((uint8_t)w);
+      const uint8x8_t dl = vget_low_u8(d);
+#define VCN_LC_M(i) a##i##l = vmlal_u8(a##i##l, vget_low_u8(v##i), dl), a##i##h = vmlal_high_u8(a##i##h, v##i, d);
+      VCN_LC_X8(VCN_LC_M)
+#undef VCN_LC_M
+    } else if (w < 0 && w > -256) {
+      const uint8x16_t d = vdupq_n_u8((uint8_t)-w);
+      const uint8x8_t dl = vget_low_u8(d);
+#define VCN_LC_M(i) a##i##l = vmlsl_u8(a##i##l, vget_low_u8(v##i), dl), a##i##h = vmlsl_high_u8(a##i##h, v##i, d);
+      VCN_LC_X8(VCN_LC_M)
+#undef VCN_LC_M
+    } else {
+      const uint16_t wu = pl->w[k];
+#define VCN_LC_M(i) a##i##l = vmlaq_n_u16(a##i##l, vmovl_u8(vget_low_u8(v##i)), wu), a##i##h = vmlaq_n_u16(a##i##h, vmovl_high_u8(v##i), wu);
+      VCN_LC_X8(VCN_LC_M)
+#undef VCN_LC_M
     }
-    vst1q_u16(pre + x, a0), vst1q_u16(pre + x + 8, a1), vst1q_u16(pre + x + 16, a2), vst1q_u16(pre + x + 24, a3);
   }
+#define VCN_LC_S(i) vst1q_u16(pre + 16 * i, a##i##l), vst1q_u16(pre + 16 * i + 8, a##i##h);
+  VCN_LC_X8(VCN_LC_S)
+#undef VCN_LC_S
 }
+#undef VCN_LC_X8
 #define VCN_LC_PRE(r, pl, b, o) vcn_lc_pre_neon(r, pl, b, o)
 #else
 #define VCN_LC_PRE(r, pl, b, o) vcn_lc_pre_c(r, pl, b, o)
@@ -1934,12 +1983,12 @@ static void vcn_lc_syms_neon(int n, const uint8_t *restrict cl, vcn_lc_dec *D, u
       en = vld1q_lane_u32(T + vgetq_lane_u32(ix, 3), en, 3);
       uint32x4_t s2 = vmlaq_u32(vshrq_n_u32(en, 20), vaddq_u32(vandq_u32(vshrq_n_u32(en, 8), kF), k1), vshlq_u32(S[h], ntb));
       const uint32x4_t m = vcltq_u32(s2, kL);
-      const unsigned bits = vaddvq_u32(vandq_u32(m, kbit));
+      const unsigned bits = vaddvq_u32(vandq_u32(m, kbit)), cnt = 0u - (unsigned)vaddvq_s32(vreinterpretq_s32_u32(m));
       if (end - p >= 8) { /* no branch on the mask: an empty mask reads nothing */
         const uint32x4_t w = vmovl_u16(vreinterpret_u16_u8(vld1_u8(p)));
         const uint32x4_t wv = vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(w), vld1q_u8(vcn_lc_perm4[bits])));
         s2 = vbslq_u32(m, vorrq_u32(vshlq_n_u32(s2, 16), wv), s2);
-        p += 2 * (unsigned)__builtin_popcount(bits);
+        p += 2 * cnt;
       } else if (bits) {
         uint32_t sv[4];
         vst1q_u32(sv, s2);
@@ -1967,19 +2016,20 @@ static void vcn_lc_syms_neon(int n, const uint8_t *restrict cl, vcn_lc_dec *D, u
       W0[h] = vld1q_u16(L->W[0] + 8 * h), W1[h] = vld1q_u16(L->W[1] + 8 * h), W2[h] = vld1q_u16(L->W[2] + 8 * h);              \
     for (int x = 0; x < VCN_LC_D; x++)                                                                                         \
       for (int h = 0; h < NH; h++) {                                                                                           \
-        const uint16x8_t P = vmlaq_u16(vmlaq_u16(vmlaq_u16(vld1q_u16(A[x] + 8 * h), W0[h], w0[h]), W1[h], w1[h]), W2[h], w2[h]); \
+        /* the newest value last, so the chain from one x to the next is one multiply-add */                               \
+        const uint16x8_t P = vmlaq_u16(vmlaq_u16(vmlaq_u16(vld1q_u16(A[x] + 8 * h), W2[h], w2[h]), W1[h], w1[h]), W0[h], w0[h]); \
         const uint16x8_t sy = vmovl_u8(vld1_u8(SY[x] + 8 * h));                                                                \
-        const int16x8_t es =                                                                                                   \
-            veorq_s16(vreinterpretq_s16_u16(vshrq_n_u16(sy, 1)), vnegq_s16(vreinterpretq_s16_u16(vandq_u16(sy, k1))));        \
-        const int16x8_t fm = vshrq_n_s16(vreinterpretq_s16_u16(vshlq_n_u16(P, 8)), 15);                                      \
-        const uint16x8_t vv = vandq_u16(                                                                                       \
-            vaddq_u16(vshrq_n_u16(vaddq_u16(P, k128), 8), vreinterpretq_u16_s16(vsubq_s16(veorq_s16(es, fm), fm))), kB);       \
+        const uint16x8_t es = veorq_u16(vshrq_n_u16(sy, 1), vnegq_u16_(vandq_u16(sy, k1)));                                   \
+        const uint16x8_t fm = vtstq_u16(P, k128);                     /* the prediction was rounded up */                    \
+        const uint16x8_t r = vbslq_u16(fm, vsubq_u16(vdupq_n_u16(0), es), es);                                                \
+        const uint16x8_t vv = vandq_u16(vsraq_n_u16(r, vaddq_u16(P, k128), 8), kB);                                            \
         W2[h] = W1[h], W1[h] = W0[h], W0[h] = vv;                                                                              \
         vst1_u8(V[x] + 8 * h, vmovn_u16(vv));                                                                                  \
       }                                                                                                                        \
     for (int h = 0; h < NH; h++)                                                                                               \
       vst1q_u16(L->W[0] + 8 * h, W0[h]), vst1q_u16(L->W[1] + 8 * h, W1[h]), vst1q_u16(L->W[2] + 8 * h, W2[h]);                 \
   } while (0)
+static inline uint16x8_t vnegq_u16_(uint16x8_t v) { return vsubq_u16(vdupq_n_u16(0), v); }
 static void vcn_lc_rec_neon(int nl, const uint16_t (*restrict A)[VCN_LC_NL], const uint8_t (*restrict SY)[VCN_LC_NL], vcn_lc_lanes *L,
                             uint8_t (*restrict V)[VCN_LC_NL]) {
   const uint16x8_t k128 = vdupq_n_u16(128), k1 = vdupq_n_u16(1), kB = vdupq_n_u16(255);
