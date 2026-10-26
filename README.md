@@ -194,9 +194,19 @@ At quant > 1 LPC's fit loses to the delta filter (it codes the multiples of
 the bin width), so LPC payloads there are delta payloads; Ctx codes the bin
 indices, 38% (quant 3) and 41% (quant 5) smaller.
 
-ARM (NEON) speeds for Ctx are not measured yet. Ctx payloads are meant to be
-byte-identical on every platform too; `tests/test_python.py` checks a golden
-digest on each CI platform.
+On Arm, the same `benchmark/run.py` command on GitHub's hosted runners
+(shared virtual machines, so expect some noise), best of 5, three runs each:
+
+| runner | LPC decode | Ctx decode | LPC encode | Ctx encode |
+|---|---|---|---|---|
+| macos-15 (Apple M1, Apple clang 17) | 381 MB/s | 416 MB/s | 155 MB/s | 193 to 203 MB/s |
+| macos-14 (Apple M1, Apple clang 15) | 305 to 331 MB/s | 277 to 324 MB/s | 100 to 107 MB/s | 130 to 143 MB/s |
+| ubuntu-24.04-arm (Neoverse N2, GCC 13) | 298 MB/s | 187 MB/s | 89 MB/s | 97 MB/s |
+
+Ctx uses NEON kernels on AArch64. On the Neoverse N2 it still decodes at
+about 0.63x of LPC. Ctx payloads are meant to be byte-identical on every
+platform too; `tests/test_python.py` checks a golden digest on each CI
+platform.
 
 ## License
 
