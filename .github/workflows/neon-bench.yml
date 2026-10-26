@@ -1,0 +1,29 @@
+name: neon-bench
+
+on:
+  push:
+    branches:
+      - neon-bench
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy s3fs
+      - run: python bench-neon/fetch.py
+      - run: bash bench-neon/run.sh
