@@ -526,9 +526,82 @@ TEST_CASE("Ctx stores constant and incompressible chunks compactly")
     }
 }
 
+TEST_CASE("Ctx codes chunks of several 128^3 tiles tile by tile")
+{
+    for (const auto shape : {std::array<int, 3>{256, 128, 128},
+                             std::array<int, 3>{128, 256, 384}}) {
+        CAPTURE(shape[1]); CAPTURE(shape[2]);
+        const std::size_t ty = shape[1] / 128, tx = shape[2] / 128;
+        const std::size_t tiles = (shape[0] / 128) * ty * tx;
+        const auto input = scrollLikeVolume(shape, 18);
+        for (const int width : {vc_delta3d::kQuantizationLossless,
+                                vc_delta3d::kQuantizationMaxError1}) {
+            CAPTURE(width);
+            const auto ctx = compressCtx(input, shape, 1, width);
+            CHECK(vc_delta3d::predictor(asSpan(ctx)) == vc_delta3d::Predictor::Ctx);
+            const auto lpc = vc_delta3d::compress(asSpan(input), shape, 1, width,
+                                                  vc_delta3d::Predictor::Lpc);
+            CHECK(ctx.size() < lpc.size());
+            const auto decoded = vc_delta3d::decompress(asSpan(ctx), input.size());
+            REQUIRE(decoded.has_value());
+            auto expected = input;
+            vc_delta3d::quantize(expected, 1, width);
+            CHECK(*decoded == expected);
+
+            // After the header: one uint32 size per tile, then each tile's
+            // stream, the same bytes as a 128^3 chunk of that tile gives.
+            std::size_t offset = 20 + 4 * tiles;
+            for (std::size_t t = 0; t < tiles; ++t) {
+                const std::size_t a = t / (ty * tx), b = t / tx % ty, c = t % tx;
+                std::vector<std::byte> tile(kCtxVoxels);
+                for (std::size_t k = 0; k < 128; ++k)
+                    for (std::size_t j = 0; j < 128; ++j)
+                        std::memcpy(tile.data() + (k * 128 + j) * 128,
+                                    input.data() + ((a * 128 + k) * shape[1] + b * 128 + j) *
+                                                       shape[2] + c * 128,
+                                    128);
+                const auto single = compressCtx(tile, kCtxShape, 1, width);
+                std::uint32_t n = 0;
+                for (int i = 3; i >= 0; --i)
+                    n = (n << 8) | std::to_integer<std::uint32_t>(ctx[20 + 4 * t + i]);
+                REQUIRE(n == single.size() - 20);
+                REQUIRE(offset + n <= ctx.size());
+                CHECK(std::equal(single.begin() + 20, single.end(), ctx.begin() + offset));
+                offset += n;
+            }
+            CHECK(offset == ctx.size());
+        }
+    }
+}
+
+TEST_CASE("Corrupt tiled Ctx payloads return nullopt")
+{
+    const std::array<int, 3> shape{256, 128, 128};
+    const auto input = scrollLikeVolume(shape, 19);
+    const auto good = compressCtx(input, shape);
+    REQUIRE(vc_delta3d::decompress(asSpan(good), input.size()).has_value());
+
+    // Stream sizes that overrun the payload or leave bytes over.
+    auto longer = good;
+    longer[20] = static_cast<std::byte>(std::to_integer<int>(longer[20]) + 1);
+    CHECK_FALSE(vc_delta3d::decompress(asSpan(longer), input.size()).has_value());
+    auto huge = good;
+    huge[27] = std::byte{0xFF};
+    CHECK_FALSE(vc_delta3d::decompress(asSpan(huge), input.size()).has_value());
+    auto extra = good;
+    extra.push_back(std::byte{0});
+    CHECK_FALSE(vc_delta3d::decompress(asSpan(extra), input.size()).has_value());
+    for (const std::size_t keep : {std::size_t{22}, std::size_t{28}, good.size() - 1}) {
+        CAPTURE(keep);
+        std::vector<std::byte> truncated(good.begin(), good.begin() + keep);
+        CHECK_FALSE(vc_delta3d::decompress(asSpan(truncated), input.size()).has_value());
+    }
+}
+
 TEST_CASE("Ctx falls back to LPC where it does not apply")
 {
-    // Any shape other than 128^3 gets the Lpc behavior, uint16 the delta filter.
+    // Shapes that are not made of 128^3 tiles get the Lpc behavior, uint16
+    // the delta filter.
     for (const auto shape : {std::array<int, 3>{64, 64, 64},
                              std::array<int, 3>{128, 128, 127},
                              std::array<int, 3>{129, 128, 128}}) {
@@ -549,23 +622,51 @@ TEST_CASE("Ctx falls back to LPC where it does not apply")
     CHECK(*decoded == input16);
 }
 
-TEST_CASE("Ctx with near-lossless quantization takes the Lpc path")
+TEST_CASE("Ctx codes quantized chunks as bin indices")
 {
-    // On quantized voxels the context model codes worse than the delta filter
-    // (multiples of the bin width defeat its fitted predictor), so a quantized
-    // Ctx chunk is exactly the Lpc payload, which bounds the error as usual.
+    // A quantized Ctx chunk decodes to exactly the snapped voxels the delta
+    // and Lpc paths give, in fewer bytes: the context model codes the bin
+    // indices, not the multiples of the width.
     const auto input = scrollLikeVolume(kCtxShape, 14);
-    const int width = vc_delta3d::kQuantizationMaxError1;
-    const auto compressed = compressCtx(input, kCtxShape, 1, width);
-    CHECK(compressed == vc_delta3d::compress(asSpan(input), kCtxShape, 1, width,
-                                             vc_delta3d::Predictor::Lpc));
-    CHECK(vc_delta3d::quantization(asSpan(compressed)) == width);
-    CHECK(compressed.size() < compressCtx(input).size());
-    const auto decoded = vc_delta3d::decompress(asSpan(compressed), input.size());
-    REQUIRE(decoded.has_value());
-    auto expected = input;
-    vc_delta3d::quantize(expected, 1, width);
-    CHECK(*decoded == expected);
+    for (const int width : {vc_delta3d::kQuantizationMaxError1,
+                            vc_delta3d::kQuantizationMaxError2, 9}) {
+        CAPTURE(width);
+        const auto compressed = compressCtx(input, kCtxShape, 1, width);
+        CHECK(vc_delta3d::predictor(asSpan(compressed)) == vc_delta3d::Predictor::Ctx);
+        CHECK(vc_delta3d::quantization(asSpan(compressed)) == width);
+        const auto lpc = vc_delta3d::compress(asSpan(input), kCtxShape, 1, width,
+                                              vc_delta3d::Predictor::Lpc);
+        CHECK(compressed.size() < lpc.size());
+        CHECK(compressed.size() < compressCtx(input).size());
+        const auto decoded = vc_delta3d::decompress(asSpan(compressed), input.size());
+        REQUIRE(decoded.has_value());
+        auto expected = input;
+        vc_delta3d::quantize(expected, 1, width);
+        CHECK(*decoded == expected);
+        // Quantization is idempotent, so recompressing the decoded chunk at
+        // the same width gives the same payload.
+        CHECK(compressCtx(*decoded, kCtxShape, 1, width) == compressed);
+    }
+}
+
+TEST_CASE("Ctx bin indices cover every value at every bin width")
+{
+    // Every byte value occurs, so each snapped value, including a clamped 255
+    // where the top bin overflows (even widths, 2k+1 not dividing 255), must
+    // come back exactly.
+    std::vector<std::byte> input(kCtxVoxels);
+    for (std::size_t i = 0; i < kCtxVoxels; ++i)
+        input[i] = static_cast<std::byte>((i / 7 + i / 131) & 0xFF);
+    for (const int width : {2, 4, 6, 7, 8, 16, 17, 51, 85, 86, 127, 128, 200, 254, 255}) {
+        CAPTURE(width);
+        const auto compressed = compressCtx(input, kCtxShape, 1, width);
+        CHECK(vc_delta3d::predictor(asSpan(compressed)) == vc_delta3d::Predictor::Ctx);
+        const auto decoded = vc_delta3d::decompress(asSpan(compressed), input.size());
+        REQUIRE(decoded.has_value());
+        auto expected = input;
+        vc_delta3d::quantize(expected, 1, width);
+        CHECK(*decoded == expected);
+    }
 }
 
 TEST_CASE("Ctx applies to every channel of a container")

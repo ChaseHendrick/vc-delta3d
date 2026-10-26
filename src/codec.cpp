@@ -1492,24 +1492,121 @@ std::optional<std::vector<std::byte>> compressLpc(
     return output;
 }
 
+// Ctx takes uint8 chunks whose dims are all multiples of kCtxDim; a chunk of
+// several 128^3 tiles is coded tile by tile.
 bool isCtxShape(std::size_t z, std::size_t y, std::size_t x)
 {
     constexpr auto d = static_cast<std::size_t>(kCtxDim);
-    return z == d && y == d && x == d;
+    return z % d == 0 && y % d == 0 && x % d == 0;
 }
 
-// Ctx payload for a quantized 128^3 uint8 chunk.
-std::vector<std::byte> compressCtx(const std::uint8_t* data, int quantBinWidth)
+// Offset of row j of slice k of tile (tz, ty, tx) in a chunk of y rows of x
+// voxels per slice.
+std::size_t ctxTileRow(std::size_t y, std::size_t x, std::size_t tz, std::size_t ty,
+                       std::size_t tx, std::size_t k, std::size_t j)
 {
-    std::vector<std::byte> output(kHeaderSize + vc_llctx_encode_bound());
-    std::size_t n = 0;
-    if (vc_llctx_encode(data, reinterpret_cast<std::uint8_t*>(output.data()) + kHeaderSize,
-                        output.size() - kHeaderSize, &n) != 0)
-        throw std::runtime_error("compress: context-model encoder failed");
-    output.resize(kHeaderSize + n);
-    writeHeader(output, 1, quantBinWidth, static_cast<unsigned>(Predictor::Ctx),
-                kCtxDim, kCtxDim, kCtxDim);
+    constexpr auto d = static_cast<std::size_t>(kCtxDim);
+    return ((tz * d + k) * y + ty * d + j) * x + tx * d;
+}
+
+// Ctx codes a quantized chunk as bin indices. The snapped values are
+// multiples of the bin width (or 255 where the top bin is clamped); coded as
+// they are, the fitted predictor's rounding leaves the multiples and every
+// voxel pays about log2(width) bits too many. ceil(v / width) numbers the
+// snapped values 0, 1, 2, ... (a clamped 255 gets the next index), and the
+// decoder maps index i back to min(i * width, 255), so the decoded voxels are
+// exactly the snapped ones.
+void ctxToBinIndices(std::uint8_t* data, std::size_t n, int width)
+{
+    std::uint8_t lut[256];
+    for (int v = 0; v < 256; ++v)
+        lut[v] = static_cast<std::uint8_t>((v + width - 1) / width);
+    for (std::size_t i = 0; i < n; ++i)
+        data[i] = lut[data[i]];
+}
+
+void ctxFromBinIndices(std::uint8_t* data, std::size_t n, int width)
+{
+    std::uint8_t lut[256];
+    for (int i = 0; i < 256; ++i)
+        lut[i] = static_cast<std::uint8_t>(std::min(i * width, 255));
+    for (std::size_t i = 0; i < n; ++i)
+        data[i] = lut[data[i]];
+}
+
+// Ctx payload for a uint8 chunk of 128^3 tiles (bin indices if quantized):
+// the header, then for a chunk of several tiles one uint32 stream size per
+// tile, then one volcodec-ng stream per tile, tiles in z, y, x order.
+std::vector<std::byte> compressCtx(const std::uint8_t* data, std::size_t z,
+                                   std::size_t y, std::size_t x, int quantBinWidth)
+{
+    constexpr auto d = static_cast<std::size_t>(kCtxDim);
+    const std::size_t tiles = (z / d) * (y / d) * (x / d);
+    const std::size_t sizes = tiles > 1 ? 4 * tiles : 0;
+    std::vector<std::byte> output(kHeaderSize + sizes);
+    std::vector<std::uint8_t> tile(tiles > 1 ? VC_LLCTX_VOXELS : 0);
+    std::size_t t = 0;
+    for (std::size_t tz = 0; tz < z / d; ++tz)
+        for (std::size_t ty = 0; ty < y / d; ++ty)
+            for (std::size_t tx = 0; tx < x / d; ++tx, ++t) {
+                const std::uint8_t* src = data;
+                if (tiles > 1) {
+                    for (std::size_t k = 0; k < d; ++k)
+                        for (std::size_t j = 0; j < d; ++j)
+                            std::memcpy(tile.data() + (k * d + j) * d,
+                                        data + ctxTileRow(y, x, tz, ty, tx, k, j), d);
+                    src = tile.data();
+                }
+                const std::size_t at = output.size();
+                output.resize(at + vc_llctx_encode_bound());
+                std::size_t n = 0;
+                if (vc_llctx_encode(src, reinterpret_cast<std::uint8_t*>(output.data()) + at,
+                                    output.size() - at, &n) != 0)
+                    throw std::runtime_error("compress: context-model encoder failed");
+                output.resize(at + n);
+                if (tiles > 1)
+                    writeU32(output.data() + kHeaderSize + 4 * t,
+                             static_cast<std::uint32_t>(n));
+            }
+    writeHeader(output, 1, quantBinWidth, static_cast<unsigned>(Predictor::Ctx), z, y, x);
     return output;
+}
+
+// Decodes a Ctx payload (after its header) into a uint8 chunk of 128^3 tiles.
+bool decompressCtx(std::span<const std::byte> payload, std::uint8_t* output,
+                   std::size_t z, std::size_t y, std::size_t x, int quantBinWidth)
+{
+    constexpr auto d = static_cast<std::size_t>(kCtxDim);
+    const std::size_t tiles = (z / d) * (y / d) * (x / d);
+    const auto* bytes = reinterpret_cast<const std::uint8_t*>(payload.data());
+    if (tiles == 1) {
+        if (vc_llctx_decode(bytes, payload.size(), output, VC_LLCTX_VOXELS) != 0)
+            return false;
+    } else {
+        if (payload.size() / 4 < tiles)
+            return false;
+        std::size_t offset = 4 * tiles;
+        std::vector<std::uint8_t> tile(VC_LLCTX_VOXELS);
+        std::size_t t = 0;
+        for (std::size_t tz = 0; tz < z / d; ++tz)
+            for (std::size_t ty = 0; ty < y / d; ++ty)
+                for (std::size_t tx = 0; tx < x / d; ++tx, ++t) {
+                    const std::size_t n = readU32(payload.data() + 4 * t);
+                    if (n > payload.size() - offset ||
+                        vc_llctx_decode(bytes + offset, n, tile.data(), tile.size()) != 0)
+                        return false;
+                    offset += n;
+                    for (std::size_t k = 0; k < d; ++k)
+                        for (std::size_t j = 0; j < d; ++j)
+                            std::memcpy(output + ctxTileRow(y, x, tz, ty, tx, k, j),
+                                        tile.data() + (k * d + j) * d, d);
+                }
+        if (offset != payload.size())
+            return false;
+    }
+    if (quantBinWidth > 1)
+        ctxFromBinIndices(output, z * y * x, quantBinWidth);
+    return true;
 }
 
 } // namespace
@@ -1543,12 +1640,12 @@ std::vector<std::byte> compress(std::span<const std::byte> input,
     std::vector<std::byte> filtered(input.begin(), input.end());
     quantize({filtered.data(), filtered.size()}, elemSize, quantBinWidth);
 
-    // Ctx is lossless only: on quantized chunks its fitted predictor loses to
-    // the delta filter (which the Lpc path below then picks).
-    if (predictor == Predictor::Ctx && elemSize == 1 &&
-        quantBinWidth == kQuantizationLossless && isCtxShape(z, y, x))
-        return compressCtx(reinterpret_cast<const std::uint8_t*>(filtered.data()),
-                           quantBinWidth);
+    if (predictor == Predictor::Ctx && elemSize == 1 && isCtxShape(z, y, x)) {
+        auto* voxels = reinterpret_cast<std::uint8_t*>(filtered.data());
+        if (quantBinWidth > 1)
+            ctxToBinIndices(voxels, filtered.size(), quantBinWidth);
+        return compressCtx(voxels, z, y, x, quantBinWidth);
+    }
 
     std::optional<std::vector<std::byte>> lpc;
     if ((predictor == Predictor::Lpc || predictor == Predictor::Ctx) && elemSize == 1 &&
@@ -1733,11 +1830,9 @@ bool decompressSingle(std::span<const std::byte> input,
     if (parsed->predictor == Predictor::Ctx) {
         if (elemSize != 1 || !isCtxShape(z, y, x))
             return false;
-        const auto stream = input.subspan(kHeaderSize);
-        return vc_llctx_decode(reinterpret_cast<const std::uint8_t*>(stream.data()),
-                               stream.size(),
-                               reinterpret_cast<std::uint8_t*>(output.data()),
-                               output.size()) == 0;
+        return decompressCtx(input.subspan(kHeaderSize),
+                             reinterpret_cast<std::uint8_t*>(output.data()), z, y, x,
+                             static_cast<int>(input[6]));
     }
 
     if (parsed->predictor == Predictor::Lpc) {

@@ -47,16 +47,19 @@ namespace vc_delta3d {
 // The encoder also builds the delta frame and keeps whichever payload is
 // smaller, so Lpc is never worse than Delta.
 //
-// Predictor::Ctx codes uint8 chunks of exactly 128^3 with a context-modelled
-// lossless coder (volcodec-ng mode 6, vendored in src/volcodec/): each voxel
-// is predicted from 40 of 82 causal neighbors in the same row, the three rows
-// above and the two previous slices, with weights least-squares fitted per
-// chunk, and the residuals are coded with static rANS tables chosen per voxel
-// by the activity of already decoded neighbors. On held-out scroll CT chunks
-// it is about 8% smaller than Lpc and encodes and decodes faster (see the
-// README). The context model is lossless only: other shapes, uint16 chunks
-// and quantized chunks (quantBinWidth > 1, where it codes worse than the
-// delta filter) get the Lpc behavior.
+// Predictor::Ctx codes uint8 chunks made of 128^3 tiles (every dim a multiple
+// of 128) with a context-modelled coder (volcodec-ng mode 6, vendored in
+// src/volcodec/): each voxel is predicted from 40 of 82 causal neighbors in
+// the same row, the three rows above and the two previous slices, with
+// weights least-squares fitted per tile, and the residuals are coded with
+// static rANS tables chosen per voxel by the activity of already decoded
+// neighbors. On held-out scroll CT chunks it is about 8% smaller than Lpc and
+// encodes and decodes faster (see the README). A quantized chunk
+// (quantBinWidth > 1) is snapped as above and coded as its bin indices
+// ceil(v / width), which the decoder maps back to min(i * width, 255): the
+// same decoded voxels as Delta and Lpc give, in about 40% fewer bytes on
+// scroll CT at widths 3 and 5. Other shapes and uint16 chunks get the Lpc
+// behavior.
 //
 // D3D1 layout (all integers little-endian):
 //   0..3   magic 'D' '3' 'D' '1'
@@ -69,9 +72,13 @@ namespace vc_delta3d {
 //          x, bit 5 y, bit 6 z). When bit 7 is clear, the filter is full zyx.
 //          LPC and Ctx: bits 4-7 are zero.
 //   8..19  chunk dims as three uint32: z, y, x (element counts)
-//   20..   Ctx only: one volcodec-ng stream, the rest of the payload (element
-//          size 1, dims 128, 128, 128; see src/volcodec/volcodec_ng_lossless.h
-//          for its 12-byte "VCNG" header and modes). Nothing below applies.
+//   20..   Ctx only (element size 1, every dim a multiple of 128): for a
+//          single 128^3 tile, one volcodec-ng stream, the rest of the payload
+//          (see src/volcodec/volcodec_ng_lossless.h for its 12-byte "VCNG"
+//          header and modes); for several tiles, one uint32 stream size per
+//          tile, then the tiles' streams, tiles in z, y, x order. If byte 6 is
+//          above 1 the streams code bin indices i, and voxel = min(i * width,
+//          255). Nothing below applies.
 //   20..   LPC only: the parameter block below (11 + 2 * taps bytes)
 //   then   256 uint16 symbol frequencies summing to 4096, then eight uint64
 //          initial rANS states, then the rANS byte stream (decoded back to
@@ -142,8 +149,9 @@ inline constexpr int kQuantizationMaxError2 = 5;
 // smaller chunks, and uint16 chunks, always use the delta filter.
 inline constexpr int kLpcMinDim = 16;
 
-// The only chunk edge Predictor::Ctx codes with the context model (all three
-// dims, uint8, lossless); everything else falls back to the Lpc behavior.
+// Tile edge of Predictor::Ctx: it codes uint8 chunks whose dims are all
+// multiples of it, tile by tile; everything else falls back to the Lpc
+// behavior.
 inline constexpr int kCtxDim = 128;
 
 // Compresses one decoded chunk of shapeZYX elements of elemSize bytes.

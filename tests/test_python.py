@@ -122,8 +122,10 @@ def test_lpc_concurrent_roundtrip():
         assert all(pool.map(roundtrip, chunks))
 
 
-# sha256 of the Ctx payload of _scroll_like((128, 128, 128), 2).
+# sha256 of the Ctx payload of _scroll_like((128, 128, 128), 2), lossless and
+# at quant=3.
 GOLDEN_CTX_SHA256 = "5ac0938475d284cec7084e22b828debf0ce0008914063d88ec5cc316d3a578be"
+GOLDEN_CTX_QUANT3_SHA256 = "726515b52d0ff7e61eb7287e3a3db1bf64833e9363e5f43e291221b58bc795de"
 
 
 def test_ctx_roundtrip_and_config():
@@ -142,12 +144,37 @@ def test_ctx_roundtrip_and_config():
 
 
 def test_ctx_falls_back_to_lpc():
-    # Shapes other than 128^3, and quantized chunks, get the LPC behavior.
+    # Shapes not made of 128^3 tiles get the LPC behavior.
     small = _scroll_like((32, 40, 36), 1)
     assert Delta3D(predictor="ctx").encode(small) == Delta3D(predictor="lpc").encode(small)
+
+
+def test_ctx_tiled_chunks():
+    # Chunks made of 128^3 tiles are coded tile by tile.
+    source = _scroll_like((128, 128, 256), 4)
+    codec = Delta3D(predictor="ctx")
+    encoded = codec.encode(source)
+    assert encoded[7] == 3
+    assert len(encoded) < len(Delta3D(predictor="lpc").encode(source))
+    decoded = np.frombuffer(codec.decode(encoded), dtype=np.uint8)
+    np.testing.assert_array_equal(decoded.reshape(source.shape), source)
+
+
+def test_ctx_quantized():
+    # Quantized 128^3 chunks stay Ctx: smaller than LPC at the same width,
+    # and decoded to exactly the same snapped voxels.
     source = _scroll_like((128, 128, 128), 3)
-    quantized = Delta3D(quant=3, predictor="ctx").encode(source)
-    assert quantized == Delta3D(quant=3, predictor="lpc").encode(source)
+    codec = Delta3D(quant=3, predictor="ctx")
+    quantized = codec.encode(source)
+    assert quantized[6] == 3 and quantized[7] == 3
+    lpc = Delta3D(quant=3, predictor="lpc")
+    lpc_encoded = lpc.encode(source)
+    assert len(quantized) < len(lpc_encoded)
+    np.testing.assert_array_equal(
+        np.frombuffer(codec.decode(quantized), np.uint8),
+        np.frombuffer(lpc.decode(lpc_encoded), np.uint8),
+    )
+    assert codec.get_config() == {"id": "vc-delta3d", "quant": 3, "predictor": "ctx"}
 
 
 def test_ctx_payload_is_identical_on_every_platform():
@@ -156,9 +183,13 @@ def test_ctx_payload_is_identical_on_every_platform():
     # must produce these bytes.
     import hashlib
 
-    encoded = Delta3D(predictor="ctx").encode(_scroll_like((128, 128, 128), 2))
+    source = _scroll_like((128, 128, 128), 2)
+    encoded = Delta3D(predictor="ctx").encode(source)
     assert encoded[7] == 3
     assert hashlib.sha256(encoded).hexdigest() == GOLDEN_CTX_SHA256
+    quantized = Delta3D(quant=3, predictor="ctx").encode(source)
+    assert quantized[7] == 3
+    assert hashlib.sha256(quantized).hexdigest() == GOLDEN_CTX_QUANT3_SHA256
 
 
 def test_ctx_concurrent_roundtrip():

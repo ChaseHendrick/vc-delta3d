@@ -20,9 +20,11 @@ class Delta3D(numcodecs.abc.Codec):
     decode. Fields it does not apply to, or where it would not be smaller,
     use the default delta filter. Decoding needs no configuration either way.
 
-    ``predictor="ctx"`` codes lossless 128^3 uint8 fields with a context-modelled
-    coder (volcodec-ng mode 6): smaller than ``"lpc"`` on scroll CT, and faster
-    to encode and decode. Other fields, and quantized ones, get ``"lpc"``.
+    ``predictor="ctx"`` codes uint8 fields made of 128^3 tiles with a
+    context-modelled coder (volcodec-ng mode 6): smaller than ``"lpc"`` on
+    scroll CT, and faster to encode and decode. With ``quant`` > 1 it codes the
+    bin indices, so it decodes to the same voxels as ``"lpc"`` in about 40%
+    fewer bytes. Other fields get ``"lpc"``.
     """
 
     codec_id = "vc-delta3d"

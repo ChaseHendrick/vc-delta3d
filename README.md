@@ -3,8 +3,8 @@
 VC-Delta3D compresses three-dimensional `uint8`, `uint16`, `int8` and `int16`
 scalar fields, and multi-channel chunks whose channels are such fields.
 It combines optional bounded scalar quantization, a choice of predictors
-(an axis-adaptive delta filter, a per-chunk linear predictor, or for lossless
-128^3 uint8 chunks a context-modelled coder), and rANS entropy coding.
+(an axis-adaptive delta filter, a per-chunk linear predictor, or for uint8
+chunks made of 128^3 tiles a context-modelled coder), and rANS entropy coding.
 
 Encoded chunks use the self-describing `D3D1` wire format and the Zarr
 compressor identifier `vc-delta3d`.
@@ -34,17 +34,18 @@ encoding and recorded in every chunk, so decoding needs no configuration.
   voxels; other chunks are stored with the delta filter. Introduced in version
   0.2.0.
 - **Ctx** (`predictor="ctx"`, C++ `vc_delta3d::Predictor::Ctx`): a
-  context-modelled lossless coder for 128^3 uint8 chunks (volcodec-ng mode 6,
+  context-modelled coder for uint8 chunks of 128^3, or of several 128^3 tiles
+  (every dim a multiple of 128, coded tile by tile; volcodec-ng mode 6,
   vendored in `src/volcodec/`). Each voxel is predicted from 40 of 82 causal
   neighbours in the same row, the three rows above and the two previous
-  slices, with weights least-squares fitted per chunk; the residuals are coded
+  slices, with weights least-squares fitted per tile; the residuals are coded
   with static rANS tables chosen per voxel by the activity of already decoded
   neighbours. Smaller than LPC on scroll CT and faster to encode and decode
-  (see Performance). Other shapes, uint16 chunks and quantized chunks are
-  stored as LPC would store them, since on quantized voxels the context model
-  codes worse than the delta filter.
+  (see Performance). Quantized chunks are coded as their bin indices, so they
+  decode to the same voxels as with delta or LPC in about 40% fewer bytes.
+  Other shapes and uint16 chunks are stored as LPC would store them.
 
-Delta and LPC can be preceded by quantization (`quant`, unsigned types only):
+Every method can be preceded by quantization (`quant`, unsigned types only):
 a bin width of 2k+1 bounds the per-voxel error by +-k, and 1 is lossless. In
 multi-channel chunks the method applies to every channel. In zarr metadata the
 codec reads e.g. `{"id": "vc-delta3d", "quant": 1, "predictor": "lpc"}`; the
@@ -62,7 +63,7 @@ auto decoded = vc_delta3d::decompress(encoded, bytes.size());
 auto smaller = vc_delta3d::compress(bytes, {z, y, x}, 1, vc_delta3d::kQuantizationLossless,
                                     vc_delta3d::Predictor::Lpc);
 
-// Lossless 128^3 uint8 chunks, smaller and faster than LPC:
+// uint8 chunks of 128^3 tiles, smaller and faster than LPC (also quantized):
 auto ctx = vc_delta3d::compress(bytes, {128, 128, 128}, 1, vc_delta3d::kQuantizationLossless,
                                 vc_delta3d::Predictor::Ctx);
 
@@ -85,7 +86,7 @@ decoded = codec.decode(encoded)
 
 # Best compression (uint8):
 codec = Delta3D(predictor="lpc")
-# Lossless 128^3 uint8 chunks, smaller and faster than LPC:
+# uint8 chunks of 128^3 tiles, smaller and faster than LPC (also quantized):
 codec = Delta3D(predictor="ctx")
 
 # 4D chunks with a channel axis ("first" or "last"); int8/int16 must stay lossless.
@@ -178,6 +179,20 @@ VM (Intel Xeon, 2.1 GHz, AVX2), best of 3, two runs each:
 | ratio | 2.82x | 3.60x | 3.86x |
 | decode MB/s | 356, 411 | 232, 200 | 273, 236 |
 | encode MB/s | 183, 173 | 58, 58 | 91, 81 |
+
+Quantized (`--quant`), the same 63 chunks on the same VM, one run, best of 5;
+at each width every column decodes to the same voxels:
+
+| | delta | LPC | Ctx |
+|---|---|---|---|
+| ratio, quant 3 | 4.13x | 4.13x | 6.69x |
+| ratio, quant 5 | 5.01x | 5.01x | 8.55x |
+| decode MB/s, quant 3 / 5 | 570 / 623 | 582 / 608 | 296 / 290 |
+| encode MB/s, quant 3 / 5 | 222 / 230 | 81 / 78 | 101 / 103 |
+
+At quant > 1 LPC's fit loses to the delta filter (it codes the multiples of
+the bin width), so LPC payloads there are delta payloads; Ctx codes the bin
+indices, 38% (quant 3) and 41% (quant 5) smaller.
 
 ARM (NEON) speeds for Ctx are not measured yet. Ctx payloads are meant to be
 byte-identical on every platform too; `tests/test_python.py` checks a golden

@@ -1,6 +1,6 @@
 // Benchmark VC-Delta3D on raw chunk files fetched by run.py.
 //
-// Usage: bench <level-dir> [reps] [delta|lpc|ctx]
+// Usage: bench <level-dir> [reps] [delta|lpc|ctx] [quant]
 //
 // <level-dir> must contain *.raw chunk files plus a shape.txt holding
 // "z y x elem_size" for every chunk in the directory. Reports the
@@ -27,7 +27,7 @@ static double now()
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: bench <level-dir> [reps] [delta|lpc|ctx]\n");
+        std::fprintf(stderr, "usage: bench <level-dir> [reps] [delta|lpc|ctx] [quant]\n");
         return 1;
     }
     const fs::path dir = argv[1];
@@ -37,6 +37,7 @@ int main(int argc, char** argv)
         predictor = vc_delta3d::Predictor::Lpc;
     else if (argc > 3 && std::strcmp(argv[3], "ctx") == 0)
         predictor = vc_delta3d::Predictor::Ctx;
+    const int quant = argc > 4 ? std::atoi(argv[4]) : 1;
 
     int z = 0, y = 0, x = 0, elem = 0;
     {
@@ -70,17 +71,19 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Warmup pass that also verifies every chunk round-trips exactly.
+    // Warmup pass that also verifies every chunk round-trips exactly (to its
+    // quantized voxels when quant > 1).
     std::size_t totalComp = 0, lpcChunks = 0, ctxChunks = 0;
     std::vector<std::vector<std::byte>> encoded;
     for (const auto& c : chunks) {
         auto enc = vc_delta3d::compress({c.data(), c.size()}, {z, y, x},
-                                        static_cast<std::size_t>(elem), 1,
+                                        static_cast<std::size_t>(elem), quant,
                                         predictor);
-        std::vector<std::byte> dec(N);
+        std::vector<std::byte> dec(N), expected(c);
+        vc_delta3d::quantize(expected, static_cast<std::size_t>(elem), quant);
         if (!vc_delta3d::decompressInto({enc.data(), enc.size()},
                                         {dec.data(), dec.size()}) ||
-            std::memcmp(dec.data(), c.data(), N) != 0) {
+            std::memcmp(dec.data(), expected.data(), N) != 0) {
             std::fprintf(stderr, "bench: roundtrip FAILED in %s\n",
                          dir.c_str());
             return 1;
@@ -99,8 +102,8 @@ int main(int argc, char** argv)
         const double t0 = now();
         for (const auto& c : chunks) {
             auto enc = vc_delta3d::compress({c.data(), c.size()}, {z, y, x},
-                                            static_cast<std::size_t>(elem), 1,
-                                        predictor);
+                                            static_cast<std::size_t>(elem), quant,
+                                            predictor);
             asm volatile("" ::"r"(enc.data()) : "memory");
         }
         bestEnc = std::min(bestEnc, now() - t0);

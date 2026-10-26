@@ -10,6 +10,7 @@ run for a given store hits the network.
 Usage:
     python3 run.py s3://bucket/path/to/volume.zarr [--chunks 50]
                    [--levels N] [--reps 5] [--predictor delta|lpc|ctx]
+                   [--quant 1]
 """
 
 from __future__ import annotations
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
                     help="timing repetitions, best-of is reported (default 5)")
     ap.add_argument("--predictor", choices=("delta", "lpc", "ctx"), default="delta",
                     help="predictor to benchmark (default delta)")
+    ap.add_argument("--quant", type=int, default=1,
+                    help="quantization bin width, 1 is lossless (default 1)")
     ap.add_argument("--min-nonzero", type=float, default=0.05,
                     help="minimum nonzero-voxel fraction per chunk "
                          "(default 0.05)")
@@ -206,7 +209,7 @@ def main() -> None:
     exe = build_bench()
     for name, _ in levels:
         subprocess.run([str(exe), str(store_cache / name), str(args.reps),
-                        args.predictor], check=True)
+                        args.predictor, str(args.quant)], check=True)
 
 
 if __name__ == "__main__":
